@@ -56,8 +56,7 @@ class PanelCreateModal(discord.ui.Modal, title='Create Ticket Panel'):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Store on interaction for the cog to pick up
-        interaction.panel_data = {
+        panel_data = {
             'title': self.panel_title.value,
             'description': self.panel_description.value,
             'color': hex_to_int(self.panel_color.value or '#2F3136'),
@@ -66,7 +65,7 @@ class PanelCreateModal(discord.ui.Modal, title='Create Ticket Panel'):
         await interaction.response.send_message(
             '✅ Panel data received! Now select which categories to show on this panel.',
             ephemeral=True,
-            view=CategoryPickerView(interaction.client, interaction.panel_data, interaction.channel)
+            view=CategoryPickerView(interaction.client, panel_data, interaction.channel)
         )
 
 
