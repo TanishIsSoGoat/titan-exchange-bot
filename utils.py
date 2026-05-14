@@ -1,121 +1,129 @@
 import discord
-import json
+import aiohttp
+import io
 
-# ── Default ticket categories ─────────────────────────────────────────────────
-DEFAULT_CATEGORIES = [
-    {"label": "Buy Crypto",      "emoji": "📈", "value": "buy_crypto",   "description": "Buy cryptocurrency"},
-    {"label": "Sell Crypto",     "emoji": "📉", "value": "sell_crypto",  "description": "Sell cryptocurrency"},
-    {"label": "Buy INR",         "emoji": "💰", "value": "buy_inr",      "description": "Buy INR"},
-    {"label": "Sell INR",        "emoji": "💵", "value": "sell_inr",     "description": "Sell INR"},
-    {"label": "Support",         "emoji": "🎧", "value": "support",      "description": "General support"},
-    {"label": "Dispute / Issue", "emoji": "⚠️", "value": "dispute",      "description": "Report a dispute or issue"},
-]
-
-CATEGORY_COLORS = {
-    "buy_crypto":  0x2ECC71,
-    "sell_crypto": 0xE74C3C,
-    "buy_inr":     0xF1C40F,
-    "sell_inr":    0x3498DB,
-    "support":     0x9B59B6,
-    "dispute":     0xFF6B35,
+CATEGORY_INFO = {
+    'i2c': {'label': 'INR → Crypto', 'emoji': '💸', 'short': 'I2C'},
+    'c2i': {'label': 'Crypto → INR', 'emoji': '💰', 'short': 'C2I'},
+    'support': {'label': 'Support', 'emoji': '🎧', 'short': 'Support'},
+    'dispute': {'label': 'Dispute / Issue', 'emoji': '⚠️', 'short': 'Dispute'},
 }
 
 def get_category_info(value: str) -> dict:
-    for c in DEFAULT_CATEGORIES:
-        if c['value'] == value:
-            return c
-    return {"label": value, "emoji": "🎫", "value": value, "description": ""}
+    return CATEGORY_INFO.get(value, {'label': value, 'emoji': '🎫', 'short': value})
+
+async def fetch_live_rate() -> float | None:
+    """Fetch live USD/INR rate from exchangerate-api (free, no key needed)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                'https://open.er-api.com/v6/latest/USD',
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data['rates'].get('INR')
+    except Exception:
+        pass
+    # Fallback
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                'https://api.frankfurter.app/latest?from=USD&to=INR',
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data['rates'].get('INR')
+    except Exception:
+        pass
+    return None
+
+async def get_rate(db, guild_id: int) -> float:
+    """Get rate — use override if set, else fetch live."""
+    config = await db.get_config(guild_id)
+    if config.get('rate_override'):
+        return float(config['rate_override'])
+    live = await fetch_live_rate()
+    return live or 84.0  # absolute fallback
 
 async def has_staff_role(member: discord.Member, config: dict) -> bool:
-    """Check if a member has any staff role (admin, mod, staff, dealer)."""
-    member_role_ids = {r.id for r in member.roles}
-    all_staff = (
-        config.get('admin_roles', []) +
-        config.get('mod_roles', []) +
-        config.get('staff_roles', []) +
-        config.get('dealer_roles', [])
-    )
-    return bool(member_role_ids & set(all_staff)) or member.guild_permissions.administrator
+    ids = {r.id for r in member.roles}
+    all_staff = (config.get('admin_roles',[]) + config.get('mod_roles',[]) +
+                 config.get('staff_roles',[]) + config.get('dealer_roles',[]))
+    return bool(ids & set(all_staff)) or member.guild_permissions.administrator
+
+async def has_admin_or_mod(member: discord.Member, config: dict) -> bool:
+    ids = {r.id for r in member.roles}
+    roles = config.get('admin_roles',[]) + config.get('mod_roles',[])
+    return bool(ids & set(roles)) or member.guild_permissions.administrator
 
 async def has_admin_role(member: discord.Member, config: dict) -> bool:
-    member_role_ids = {r.id for r in member.roles}
-    return (
-        bool(member_role_ids & set(config.get('admin_roles', []))) or
-        member.guild_permissions.administrator
-    )
+    ids = {r.id for r in member.roles}
+    return bool(ids & set(config.get('admin_roles',[]))) or member.guild_permissions.administrator
 
-def build_ticket_embed(category_value: str, user: discord.Member, ticket_number: int,
-                       claimed_by: discord.Member = None) -> discord.Embed:
-    info = get_category_info(category_value)
-    color = CATEGORY_COLORS.get(category_value, 0x2F3136)
-    embed = discord.Embed(
-        title=f"{info['emoji']} {info['label']} — Ticket #{ticket_number:04d}",
-        description=(
-            f"**Opened by:** {user.mention}\n"
-            f"**Category:** {info['label']}\n"
-            f"{'**Claimed by:** ' + claimed_by.mention if claimed_by else '**Status:** Unclaimed'}\n\n"
-            f"> Please describe your request and a staff member will assist you shortly.\n"
-            f"> Do **not** ping staff — be patient and wait."
-        ),
-        color=color
-    )
-    embed.set_footer(text="Titan Exchange | Close ticket with /close or !close")
-    embed.set_thumbnail(url="https://cdn.discordapp.com/embed/avatars/0.png")
-    return embed
-
-def build_panel_embed(title: str, description: str, color: int,
-                      footer: str = None, thumbnail: str = None) -> discord.Embed:
-    embed = discord.Embed(title=title, description=description, color=color)
-    if footer:
-        embed.set_footer(text=footer)
-    else:
-        embed.set_footer(text="Titan Exchange | Click a button below to open a ticket")
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-    return embed
+def is_exchanger_role(member: discord.Member, config: dict) -> bool:
+    ids = {r.id for r in member.roles}
+    return bool(ids & set(config.get('dealer_roles',[])))
 
 def hex_to_int(hex_str: str) -> int:
-    hex_str = hex_str.strip().lstrip('#')
     try:
-        return int(hex_str, 16)
+        return int(hex_str.strip().lstrip('#'), 16)
     except ValueError:
         return 0x2F3136
 
-async def generate_html_transcript(ticket: dict, messages: list, guild: discord.Guild) -> str:
-    info = get_category_info(ticket.get('category', ''))
-    rows = ""
-    for msg in messages:
-        rows += f"""
-        <div class="message">
-            <span class="author">{discord.utils.escape_mentions(msg['author_name'])}</span>
-            <span class="time">{msg['timestamp']}</span>
-            <div class="content">{discord.utils.escape_mentions(str(msg['content']))}</div>
-        </div>"""
+def build_ticket_embed(category: str, user: discord.Member, ticket_number: int,
+                       claimed_by: discord.Member = None, modal_answers: dict = None) -> discord.Embed:
+    info = get_category_info(category)
+    colors = {'i2c': 0x2ECC71, 'c2i': 0xE74C3C, 'support': 0x9B59B6, 'dispute': 0xFF6B35}
+    color = colors.get(category, 0x5865F2)
+    embed = discord.Embed(
+        title=f"{info['emoji']} {info['label']} — Ticket #{ticket_number:04d}",
+        color=color
+    )
+    embed.add_field(name='👤 Client', value=user.mention, inline=True)
+    embed.add_field(name='📋 Category', value=info['label'], inline=True)
+    if claimed_by:
+        embed.add_field(name='👷 Claimed By', value=claimed_by.mention, inline=True)
+    else:
+        embed.add_field(name='👷 Status', value='`Unclaimed`', inline=True)
+    if modal_answers:
+        for k, v in modal_answers.items():
+            embed.add_field(name=k, value=f'`{v}`', inline=True)
+    embed.add_field(
+        name='📌 Instructions',
+        value='> Staff will assist you shortly.\n> Do **not** ping staff — be patient.',
+        inline=False
+    )
+    embed.set_footer(text='Titan Exchange | /close to close ticket (staff only)')
+    return embed
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Ticket #{ticket['ticket_number']:04d} Transcript</title>
+async def generate_html_transcript(ticket: dict, messages: list, guild: discord.Guild) -> str:
+    info = get_category_info(ticket.get('category',''))
+    rows = ''.join(f'''
+        <div class="message">
+            <span class="author">{m["author_name"]}</span>
+            <span class="time">{m["timestamp"]}</span>
+            <div class="content">{str(m["content"]).replace("<","&lt;").replace(">","&gt;")}</div>
+        </div>''' for m in messages)
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>Ticket #{ticket['ticket_number']:04d}</title>
 <style>
-  body {{ font-family: 'Segoe UI', sans-serif; background: #1e1f22; color: #dcddde; margin: 0; padding: 0; }}
-  .header {{ background: #2b2d31; padding: 20px 30px; border-bottom: 3px solid #5865F2; }}
-  .header h1 {{ margin: 0; color: #fff; font-size: 1.4em; }}
-  .header p {{ margin: 4px 0 0; color: #b9bbbe; font-size: 0.9em; }}
-  .messages {{ padding: 20px 30px; max-width: 900px; margin: auto; }}
-  .message {{ padding: 10px 14px; margin: 6px 0; background: #2b2d31; border-radius: 8px; }}
-  .author {{ font-weight: bold; color: #5865F2; margin-right: 10px; }}
-  .time {{ font-size: 0.75em; color: #72767d; }}
-  .content {{ margin-top: 4px; white-space: pre-wrap; word-break: break-word; }}
-  .footer {{ text-align: center; padding: 20px; color: #72767d; font-size: 0.8em; }}
-</style>
-</head>
-<body>
+body{{font-family:'Segoe UI',sans-serif;background:#1e1f22;color:#dcddde;margin:0;padding:0}}
+.header{{background:#2b2d31;padding:20px 30px;border-bottom:3px solid #5865F2}}
+.header h1{{margin:0;color:#fff;font-size:1.4em}}
+.header p{{margin:4px 0 0;color:#b9bbbe;font-size:.9em}}
+.messages{{padding:20px 30px;max-width:900px;margin:auto}}
+.message{{padding:10px 14px;margin:6px 0;background:#2b2d31;border-radius:8px}}
+.author{{font-weight:bold;color:#5865F2;margin-right:10px}}
+.time{{font-size:.75em;color:#72767d}}
+.content{{margin-top:4px;white-space:pre-wrap;word-break:break-word}}
+.footer{{text-align:center;padding:20px;color:#72767d;font-size:.8em}}
+</style></head><body>
 <div class="header">
   <h1>{info['emoji']} Ticket #{ticket['ticket_number']:04d} — {info['label']}</h1>
-  <p>Server: {guild.name} &nbsp;|&nbsp; Status: {ticket['status'].upper()} &nbsp;|&nbsp; Opened: {ticket['opened_at']}</p>
+  <p>Server: {guild.name} | Status: {ticket['status'].upper()} | Opened: {ticket['opened_at']}</p>
 </div>
-<div class="messages">{rows if rows else '<p style="color:#72767d">No messages logged.</p>'}</div>
-<div class="footer">Titan Exchange Transcript &mdash; Generated automatically</div>
-</body>
-</html>"""
+<div class="messages">{rows or '<p style="color:#72767d">No messages logged.</p>'}</div>
+<div class="footer">Titan Exchange Transcript</div>
+</body></html>"""

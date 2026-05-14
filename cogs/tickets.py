@@ -1,262 +1,232 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import asyncio
-import io
+import asyncio, io
 from utils import (
-    has_staff_role, has_admin_role, build_ticket_embed,
-    get_category_info, generate_html_transcript, CATEGORY_COLORS
+    has_staff_role, has_admin_or_mod, build_ticket_embed,
+    get_category_info, generate_html_transcript, get_rate, is_exchanger_role
 )
 
-MAX_OPEN_TICKETS = 1  # Max open tickets per user per guild
+MAX_OPEN = 1  # max open tickets per user
 
 
-class TicketCloseView(discord.ui.View):
+class ClaimAmountModal(discord.ui.Modal, title='Claim Ticket — Enter Deal Amount'):
+    amount = discord.ui.TextInput(
+        label='Deal Amount',
+        placeholder='Enter amount in $ e.g. 15 (for $15 deal)',
+        required=True, max_length=20
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            usd = float(self.amount.value.strip().replace('$', ''))
+        except ValueError:
+            return await interaction.response.send_message('❌ Invalid amount.', ephemeral=True)
+
+        cog = interaction.client.get_cog('Tickets')
+        if cog:
+            await cog._do_claim(interaction, usd)
+
+
+class TicketControlView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
         self.bot = bot
 
-    @discord.ui.button(label='🔒 Close Ticket', style=discord.ButtonStyle.danger, custom_id='ticket:close')
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        cog = self.bot.get_cog('Tickets')
+    @discord.ui.button(label='🔒 Close', style=discord.ButtonStyle.danger, custom_id='ticket:close')
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await interaction.client.db.get_config(interaction.guild.id)
+        if not await has_admin_or_mod(interaction.user, config):
+            return await interaction.response.send_message('❌ Only Admin/Mod can close tickets.', ephemeral=True)
+        await interaction.response.defer()
+        cog = interaction.client.get_cog('Tickets')
         if cog:
             await cog._close_ticket(interaction.channel, interaction.user)
 
     @discord.ui.button(label='👤 Claim', style=discord.ButtonStyle.primary, custom_id='ticket:claim')
-    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         config = await interaction.client.db.get_config(interaction.guild.id)
-        if not await has_staff_role(interaction.member, config):
-            return await interaction.response.send_message('❌ Only staff can claim tickets.', ephemeral=True)
+        if not await has_staff_role(interaction.user, config):
+            return await interaction.response.send_message('❌ Staff only.', ephemeral=True)
         ticket = await interaction.client.db.get_ticket_by_channel(interaction.channel.id)
         if not ticket:
-            return await interaction.response.send_message('❌ Ticket not found.', ephemeral=True)
+            return await interaction.response.send_message('❌ Not a ticket channel.', ephemeral=True)
         if ticket['claimed_by']:
             claimer = interaction.guild.get_member(ticket['claimed_by'])
-            name = claimer.display_name if claimer else 'Someone'
-            return await interaction.response.send_message(f'❌ Already claimed by **{name}**.', ephemeral=True)
-
-        await interaction.client.db.claim_ticket(interaction.channel.id, interaction.user.id)
-        user = interaction.guild.get_member(ticket['user_id'])
-        embed = build_ticket_embed(ticket['category'], user, ticket['ticket_number'], interaction.user)
-        await interaction.message.edit(embed=embed)
-        await interaction.response.send_message(f'✅ {interaction.user.mention} claimed this ticket.', ephemeral=False)
-
-    @discord.ui.button(label='➕ Add User', style=discord.ButtonStyle.secondary, custom_id='ticket:adduser')
-    async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
-        config = await interaction.client.db.get_config(interaction.guild.id)
-        if not await has_staff_role(interaction.member, config):
-            return await interaction.response.send_message('❌ Only staff can add users.', ephemeral=True)
-
-        modal = AddUserModal()
-        await interaction.response.send_modal(modal)
-
-
-class AddUserModal(discord.ui.Modal, title='Add User to Ticket'):
-    user_id = discord.ui.TextInput(
-        label='User ID or Mention',
-        placeholder='Enter user ID e.g. 123456789012345678',
-        required=True,
-        max_length=30
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = self.user_id.value.strip().replace('<@', '').replace('>', '').replace('!', '')
-        try:
-            uid = int(raw)
-            member = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
-        except (ValueError, discord.NotFound):
-            return await interaction.response.send_message('❌ User not found.', ephemeral=True)
-
-        await interaction.channel.set_permissions(member, read_messages=True, send_messages=True)
-        await interaction.response.send_message(f'✅ Added {member.mention} to the ticket.')
-
-
-class CategorySelectView(discord.ui.View):
-    """View shown on the ticket panel — one button per category."""
-
-    def __init__(self, bot, categories: list):
-        super().__init__(timeout=None)
-        self.bot = bot
-        for cat in categories:
-            btn = discord.ui.Button(
-                label=cat['label'],
-                emoji=cat.get('emoji', '🎫'),
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"panel:open:{cat['value']}"
-            )
-            btn.callback = self._make_callback(cat['value'])
-            self.add_item(btn)
-
-    def _make_callback(self, category_value: str):
-        async def callback(interaction: discord.Interaction):
-            cog = self.bot.get_cog('Tickets')
-            if cog:
-                await cog._open_ticket(interaction, category_value)
-        return callback
+            return await interaction.response.send_message(
+                f'❌ Already claimed by {claimer.mention if claimer else "someone"}.', ephemeral=True)
+        # Only check limit for exchange tickets
+        if ticket['category'] in ('i2c', 'c2i'):
+            await interaction.response.send_modal(ClaimAmountModal())
+        else:
+            # Support/dispute — no limit check needed
+            await interaction.client.db.claim_ticket(interaction.channel.id, interaction.user.id)
+            user = interaction.guild.get_member(ticket['user_id'])
+            embed = build_ticket_embed(ticket['category'], user, ticket['ticket_number'], interaction.user)
+            try:
+                await interaction.message.edit(embed=embed)
+            except Exception:
+                pass
+            await interaction.response.send_message(f'✅ {interaction.user.mention} claimed this ticket.')
 
 
 class Tickets(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Re-register persistent views on startup
         bot.loop.create_task(self._register_views())
 
     async def _register_views(self):
         await self.bot.wait_until_ready()
-        self.bot.add_view(TicketCloseView(self.bot))
+        self.bot.add_view(TicketControlView(self.bot))
 
-    async def _open_ticket(self, interaction: discord.Interaction, category_value: str):
+    async def _open_ticket(self, interaction: discord.Interaction, category: str, answers: dict = None):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         user = interaction.user
         config = await self.bot.db.get_config(guild.id)
 
-        # Check for existing open ticket
         open_tickets = await self.bot.db.get_open_tickets(guild.id, user.id)
-        if len(open_tickets) >= MAX_OPEN_TICKETS:
+        if len(open_tickets) >= MAX_OPEN:
             ch = guild.get_channel(open_tickets[0]['channel_id'])
-            mention = ch.mention if ch else 'an existing channel'
             return await interaction.followup.send(
-                f'❌ You already have an open ticket: {mention}', ephemeral=True
-            )
+                f'❌ You already have an open ticket: {ch.mention if ch else "existing channel"}', ephemeral=True)
 
-        # Get/create ticket category
-        category = None
+        # Get/create category
+        cat_channel = None
         if config['ticket_category']:
-            category = guild.get_channel(config['ticket_category'])
-        if not category:
-            category = await guild.create_category('📩 Tickets')
-            await self.bot.db.set_config(guild.id, ticket_category=category.id)
+            cat_channel = guild.get_channel(config['ticket_category'])
+        if not cat_channel:
+            cat_channel = await guild.create_category('📩 Tickets')
+            await self.bot.db.set_config(guild.id, ticket_category=cat_channel.id)
 
-        # Ticket number
         ticket_num = await self.bot.db.increment_ticket_counter(guild.id)
-        info = get_category_info(category_value)
-        channel_name = f"ticket-{ticket_num:04d}-{user.name[:10].lower()}"
+        info = get_category_info(category)
+        ch_name = f"{info['short'].lower()}-{ticket_num:04d}-{user.name[:8].lower()}"
 
-        # Build permission overwrites
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True),
         }
-        for role_list_key in ['admin_roles', 'mod_roles', 'staff_roles', 'dealer_roles']:
-            for role_id in config.get(role_list_key, []):
-                role = guild.get_role(role_id)
+        for key in ['admin_roles', 'mod_roles', 'staff_roles', 'dealer_roles']:
+            for rid in config.get(key, []):
+                role = guild.get_role(rid)
                 if role:
                     overwrites[role] = discord.PermissionOverwrite(
-                        read_messages=True, send_messages=True, attach_files=True
-                    )
+                        read_messages=True, send_messages=True, attach_files=True)
 
-        # Create channel
         channel = await guild.create_text_channel(
-            channel_name,
-            category=category,
-            overwrites=overwrites,
+            ch_name, category=cat_channel, overwrites=overwrites,
             topic=f"Ticket #{ticket_num:04d} | {info['label']} | {user} ({user.id})"
         )
 
-        # Save to DB
-        ticket_id = await self.bot.db.create_ticket(
-            guild.id, channel.id, user.id, category_value, ticket_num
-        )
+        ticket_id = await self.bot.db.create_ticket(guild.id, channel.id, user.id, category, ticket_num)
 
-        # Send ticket embed
-        embed = build_ticket_embed(category_value, user, ticket_num)
-        view = TicketCloseView(self.bot)
-        msg = await channel.send(
-            content=f"{user.mention} Welcome! Staff will be with you shortly.",
-            embed=embed,
-            view=view
-        )
+        embed = build_ticket_embed(category, user, ticket_num, modal_answers=answers)
+        view = TicketControlView(self.bot)
+        msg = await channel.send(content=f"{user.mention}", embed=embed, view=view)
         await msg.pin()
 
-        await interaction.followup.send(
-            f'✅ Your ticket has been opened: {channel.mention}', ephemeral=True
-        )
+        await interaction.followup.send(f'✅ Ticket opened: {channel.mention}', ephemeral=True)
 
-        # Log to log channel
         if config['log_channel']:
-            log_ch = guild.get_channel(config['log_channel'])
-            if log_ch:
-                log_embed = discord.Embed(
-                    title='📂 Ticket Opened',
-                    color=CATEGORY_COLORS.get(category_value, 0x2ECC71),
-                    description=(
-                        f"**User:** {user.mention} (`{user.id}`)\n"
-                        f"**Category:** {info['emoji']} {info['label']}\n"
-                        f"**Channel:** {channel.mention}\n"
-                        f"**Ticket #:** {ticket_num:04d}"
-                    )
+            lch = guild.get_channel(config['log_channel'])
+            if lch:
+                lembed = discord.Embed(title='📂 Ticket Opened', color=0x2ECC71,
+                    description=f"**User:** {user.mention}\n**Category:** {info['emoji']} {info['label']}\n**Channel:** {channel.mention}")
+                await lch.send(embed=lembed)
+
+    async def _do_claim(self, interaction: discord.Interaction, amount_usd: float):
+        """Called after exchanger enters amount in modal."""
+        guild = interaction.guild
+        config = await self.bot.db.get_config(guild.id)
+        ticket = await self.bot.db.get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            return await interaction.response.send_message('❌ Not a ticket.', ephemeral=True)
+
+        rate = await get_rate(self.bot.db, guild.id)
+        amount_inr = round(amount_usd * rate, 2)
+
+        # Check exchanger limit
+        lim = await self.bot.db.get_exchanger_limit(guild.id, interaction.user.id)
+        limit_usd = lim['limit_usd']
+        used_usd = lim['used_usd']
+
+        if limit_usd > 0:
+            if used_usd + amount_usd > limit_usd:
+                avail = limit_usd - used_usd
+                return await interaction.response.send_message(
+                    f'❌ **Limit exceeded!**\n'
+                    f'Your limit: **${limit_usd}**\n'
+                    f'Currently in use: **${used_usd}**\n'
+                    f'Available: **${avail:.2f}**\n'
+                    f'This deal: **${amount_usd}**\n\n'
+                    f'You cannot claim deals that exceed your available limit.',
+                    ephemeral=True
                 )
-                await log_ch.send(embed=log_embed)
+
+        # Add to used limit
+        await self.bot.db.add_used_limit(guild.id, interaction.user.id, amount_usd)
+
+        # Claim ticket
+        await self.bot.db.claim_ticket(interaction.channel.id, interaction.user.id, amount_usd, amount_inr)
+
+        user = guild.get_member(ticket['user_id'])
+        embed = build_ticket_embed(ticket['category'], user, ticket['ticket_number'], interaction.user)
+        try:
+            # Try to find and edit the pinned message
+            pins = await interaction.channel.pins()
+            for pin in pins:
+                if pin.author == guild.me:
+                    await pin.edit(embed=embed)
+                    break
+        except Exception:
+            pass
+
+        await interaction.response.send_message(
+            f'✅ {interaction.user.mention} claimed this ticket!\n'
+            f'💲 Deal Amount: **${amount_usd}** (~₹{amount_inr:,.2f})\n'
+            f'📊 Limit used: **${used_usd + amount_usd:.2f}** / **${limit_usd}**'
+        )
 
     async def _close_ticket(self, channel: discord.TextChannel, closer: discord.Member):
         ticket = await self.bot.db.get_ticket_by_channel(channel.id)
         if not ticket:
-            return await channel.send('❌ This channel is not a ticket.')
+            return await channel.send('❌ Not a ticket channel.')
 
         guild = channel.guild
         config = await self.bot.db.get_config(guild.id)
 
-        # Check permission: opener or staff
-        is_opener = ticket['user_id'] == closer.id
-        is_staff = await has_staff_role(closer, config)
-        if not is_opener and not is_staff:
-            return await channel.send('❌ Only the ticket opener or staff can close this ticket.')
+        if not await has_admin_or_mod(closer, config):
+            return await channel.send('❌ Only Admin/Mod can close tickets.')
 
-        # Notify
-        await channel.send('🔒 Closing ticket and saving transcript...')
+        await channel.send('🔒 Saving transcript and closing...')
         await asyncio.sleep(1)
 
-        # Generate transcript
         messages = await self.bot.db.get_transcript(ticket['id'])
         html = await generate_html_transcript(ticket, messages, guild)
-
-        # Close in DB
         await self.bot.db.close_ticket(channel.id)
 
-        # Send transcript
+        file = discord.File(io.BytesIO(html.encode()), filename=f"ticket-{ticket['ticket_number']:04d}.html")
+
         if config['transcript_channel']:
             tr_ch = guild.get_channel(config['transcript_channel'])
             if tr_ch:
-                info = get_category_info(ticket['category'])
                 opener = guild.get_member(ticket['user_id'])
-                embed = discord.Embed(
-                    title=f"📄 Transcript — Ticket #{ticket['ticket_number']:04d}",
-                    color=0x5865F2,
-                    description=(
-                        f"**Category:** {info['emoji']} {info['label']}\n"
-                        f"**Opened by:** {opener.mention if opener else ticket['user_id']}\n"
-                        f"**Closed by:** {closer.mention}\n"
-                        f"**Messages logged:** {len(messages)}"
-                    )
-                )
-                file = discord.File(
-                    io.BytesIO(html.encode()),
-                    filename=f"ticket-{ticket['ticket_number']:04d}.html"
-                )
+                info = get_category_info(ticket['category'])
+                embed = discord.Embed(title=f"📄 Transcript — #{ticket['ticket_number']:04d}", color=0x5865F2,
+                    description=f"**Category:** {info['emoji']} {info['label']}\n**Opened by:** {opener.mention if opener else ticket['user_id']}\n**Closed by:** {closer.mention}")
                 await tr_ch.send(embed=embed, file=file)
 
-        # Log closure
         if config['log_channel']:
-            log_ch = guild.get_channel(config['log_channel'])
-            if log_ch:
-                log_embed = discord.Embed(
-                    title='🔒 Ticket Closed',
-                    color=0xE74C3C,
-                    description=(
-                        f"**Ticket #:** {ticket['ticket_number']:04d}\n"
-                        f"**Closed by:** {closer.mention}\n"
-                        f"**Channel:** #{channel.name}"
-                    )
-                )
-                await log_ch.send(embed=log_embed)
+            lch = guild.get_channel(config['log_channel'])
+            if lch:
+                embed = discord.Embed(title='🔒 Ticket Closed', color=0xE74C3C,
+                    description=f"**Ticket #:** {ticket['ticket_number']:04d}\n**Closed by:** {closer.mention}")
+                await lch.send(embed=embed)
 
         await asyncio.sleep(2)
-        await channel.delete(reason=f"Ticket closed by {closer}")
-
-    # ── Message logging for transcripts ───────────────────────────────────────
+        await channel.delete(reason=f'Closed by {closer}')
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -267,46 +237,43 @@ class Tickets(commands.Cog):
             content = message.content or ''
             if message.attachments:
                 content += ' ' + ' '.join(a.url for a in message.attachments)
-            await self.bot.db.log_message(
-                ticket['id'], message.author.id,
-                str(message.author), content[:2000]
-            )
+            await self.bot.db.log_message(ticket['id'], message.author.id, str(message.author), content[:2000])
 
-    # ── Slash commands ────────────────────────────────────────────────────────
-
-    @app_commands.command(name='close', description='Close the current ticket')
+    @app_commands.command(name='close', description='Close the current ticket (Admin/Mod only)')
     async def slash_close(self, interaction: discord.Interaction):
+        config = await self.bot.db.get_config(interaction.guild.id)
+        if not await has_admin_or_mod(interaction.user, config):
+            return await interaction.response.send_message('❌ Admin/Mod only.', ephemeral=True)
         await interaction.response.defer()
         await self._close_ticket(interaction.channel, interaction.user)
 
     @app_commands.command(name='add', description='Add a user to this ticket')
-    @app_commands.describe(member='The member to add')
+    @app_commands.describe(member='Member to add')
     async def slash_add(self, interaction: discord.Interaction, member: discord.Member):
         config = await self.bot.db.get_config(interaction.guild.id)
         if not await has_staff_role(interaction.user, config):
             return await interaction.response.send_message('❌ Staff only.', ephemeral=True)
         await interaction.channel.set_permissions(member, read_messages=True, send_messages=True)
-        await interaction.response.send_message(f'✅ Added {member.mention} to the ticket.')
+        await interaction.response.send_message(f'✅ Added {member.mention}.')
 
     @app_commands.command(name='remove', description='Remove a user from this ticket')
-    @app_commands.describe(member='The member to remove')
+    @app_commands.describe(member='Member to remove')
     async def slash_remove(self, interaction: discord.Interaction, member: discord.Member):
         config = await self.bot.db.get_config(interaction.guild.id)
         if not await has_staff_role(interaction.user, config):
             return await interaction.response.send_message('❌ Staff only.', ephemeral=True)
         await interaction.channel.set_permissions(member, overwrite=None)
-        await interaction.response.send_message(f'✅ Removed {member.mention} from the ticket.')
-
-    # ── Prefix commands ───────────────────────────────────────────────────────
+        await interaction.response.send_message(f'✅ Removed {member.mention}.')
 
     @commands.command(name='close')
-    async def prefix_close(self, ctx: commands.Context):
-        """Close the current ticket."""
+    async def prefix_close(self, ctx):
+        config = await self.bot.db.get_config(ctx.guild.id)
+        if not await has_admin_or_mod(ctx.author, config):
+            return await ctx.send('❌ Admin/Mod only.')
         await self._close_ticket(ctx.channel, ctx.author)
 
     @commands.command(name='add')
-    async def prefix_add(self, ctx: commands.Context, member: discord.Member):
-        """Add a user to the current ticket."""
+    async def prefix_add(self, ctx, member: discord.Member):
         config = await self.bot.db.get_config(ctx.guild.id)
         if not await has_staff_role(ctx.author, config):
             return await ctx.send('❌ Staff only.')
@@ -314,8 +281,7 @@ class Tickets(commands.Cog):
         await ctx.send(f'✅ Added {member.mention}.')
 
     @commands.command(name='remove')
-    async def prefix_remove(self, ctx: commands.Context, member: discord.Member):
-        """Remove a user from the current ticket."""
+    async def prefix_remove(self, ctx, member: discord.Member):
         config = await self.bot.db.get_config(ctx.guild.id)
         if not await has_staff_role(ctx.author, config):
             return await ctx.send('❌ Staff only.')
