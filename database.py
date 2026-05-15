@@ -23,8 +23,9 @@ class Database:
                     ticket_counter      INTEGER DEFAULT 0,
                     vouch_channel       INTEGER,
                     rate_override       REAL,
-                    i2c_rate            REAL DEFAULT 101.0,
-                    c2i_rate            REAL DEFAULT 97.5
+                    rate_i2c            REAL DEFAULT 101,
+                    rate_c2i_below      REAL DEFAULT 97.5,
+                    rate_c2i_above      REAL DEFAULT 98.5
                 );
 
                 CREATE TABLE IF NOT EXISTS panels (
@@ -95,15 +96,6 @@ class Database:
                     PRIMARY KEY (guild_id, user_id, role)
                 );
             ''')
-            # Migration: add new columns if they don't exist yet (safe for existing DBs)
-            for col, definition in [
-                ('i2c_rate', 'REAL DEFAULT 101.0'),
-                ('c2i_rate', 'REAL DEFAULT 97.5'),
-            ]:
-                try:
-                    await db.execute(f'ALTER TABLE guild_config ADD COLUMN {col} {definition}')
-                except Exception:
-                    pass  # Column already exists
             await db.commit()
 
     # ── Config ────────────────────────────────────────────────────────────────
@@ -116,51 +108,39 @@ class Database:
                 if not row:
                     await db.execute('INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)', (guild_id,))
                     await db.commit()
-                    return {
-                        'guild_id': guild_id, 'prefix': '!',
-                        'log_channel': None, 'transcript_channel': None, 'ticket_category': None,
-                        'admin_roles': [], 'mod_roles': [], 'staff_roles': [], 'dealer_roles': [],
-                        'ticket_counter': 0, 'vouch_channel': None, 'rate_override': None,
-                        'i2c_rate': 101.0, 'c2i_rate': 97.5,
-                    }
+                    return {'guild_id': guild_id, 'prefix': '!', 'log_channel': None,
+                            'transcript_channel': None, 'ticket_category': None,
+                            'admin_roles': [], 'mod_roles': [], 'staff_roles': [], 'dealer_roles': [],
+                            'ticket_counter': 0, 'vouch_channel': None, 'rate_override': None, 'rate_i2c': 101, 'rate_c2i_below': 97.5, 'rate_c2i_above': 98.5}
                 d = dict(row)
-                for k in ['admin_roles', 'mod_roles', 'staff_roles', 'dealer_roles']:
+                for k in ['admin_roles','mod_roles','staff_roles','dealer_roles']:
                     d[k] = json.loads(d[k] or '[]')
-                # Ensure new fields have defaults if missing
-                d.setdefault('i2c_rate', 101.0)
-                d.setdefault('c2i_rate', 97.5)
                 return d
 
     async def set_config(self, guild_id: int, **kwargs):
         config = await self.get_config(guild_id)
         config.update(kwargs)
-        for k in ['admin_roles', 'mod_roles', 'staff_roles', 'dealer_roles']:
+        for k in ['admin_roles','mod_roles','staff_roles','dealer_roles']:
             if isinstance(config[k], list):
                 config[k] = json.dumps(config[k])
         async with aiosqlite.connect(self.path) as db:
             await db.execute('''
                 INSERT INTO guild_config
                     (guild_id,prefix,log_channel,transcript_channel,ticket_category,
-                     admin_roles,mod_roles,staff_roles,dealer_roles,ticket_counter,
-                     vouch_channel,rate_override,i2c_rate,c2i_rate)
+                     admin_roles,mod_roles,staff_roles,dealer_roles,ticket_counter,vouch_channel,rate_override,rate_i2c,rate_c2i_below,rate_c2i_above)
                 VALUES
                     (:guild_id,:prefix,:log_channel,:transcript_channel,:ticket_category,
-                     :admin_roles,:mod_roles,:staff_roles,:dealer_roles,:ticket_counter,
-                     :vouch_channel,:rate_override,:i2c_rate,:c2i_rate)
+                     :admin_roles,:mod_roles,:staff_roles,:dealer_roles,:ticket_counter,:vouch_channel,:rate_override,:rate_i2c,:rate_c2i_below,:rate_c2i_above)
                 ON CONFLICT(guild_id) DO UPDATE SET
-                    prefix=excluded.prefix,
-                    log_channel=excluded.log_channel,
-                    transcript_channel=excluded.transcript_channel,
-                    ticket_category=excluded.ticket_category,
-                    admin_roles=excluded.admin_roles,
-                    mod_roles=excluded.mod_roles,
-                    staff_roles=excluded.staff_roles,
-                    dealer_roles=excluded.dealer_roles,
-                    ticket_counter=excluded.ticket_counter,
-                    vouch_channel=excluded.vouch_channel,
+                    prefix=excluded.prefix, log_channel=excluded.log_channel,
+                    transcript_channel=excluded.transcript_channel, ticket_category=excluded.ticket_category,
+                    admin_roles=excluded.admin_roles, mod_roles=excluded.mod_roles,
+                    staff_roles=excluded.staff_roles, dealer_roles=excluded.dealer_roles,
+                    ticket_counter=excluded.ticket_counter, vouch_channel=excluded.vouch_channel,
                     rate_override=excluded.rate_override,
-                    i2c_rate=excluded.i2c_rate,
-                    c2i_rate=excluded.c2i_rate
+                    rate_i2c=excluded.rate_i2c,
+                    rate_c2i_below=excluded.rate_c2i_below,
+                    rate_c2i_above=excluded.rate_c2i_above
             ''', config)
             await db.commit()
 
@@ -221,24 +201,11 @@ class Database:
                 (guild_id, user_id)) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
-    async def store_ticket_amounts(self, channel_id: int, amount_usd: float, amount_inr: float):
-        """Store pre-calculated deal amounts on ticket creation (before claiming)."""
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                'UPDATE tickets SET deal_amount_usd=?, deal_amount_inr=? WHERE channel_id=?',
-                (amount_usd, amount_inr, channel_id))
-            await db.commit()
-
     async def claim_ticket(self, channel_id: int, staff_id: int, amount_usd: float = None, amount_inr: float = None):
         async with aiosqlite.connect(self.path) as db:
-            if amount_usd is not None:
-                await db.execute(
-                    'UPDATE tickets SET claimed_by=?, deal_amount_usd=?, deal_amount_inr=? WHERE channel_id=?',
-                    (staff_id, amount_usd, amount_inr, channel_id))
-            else:
-                await db.execute(
-                    'UPDATE tickets SET claimed_by=? WHERE channel_id=?',
-                    (staff_id, channel_id))
+            await db.execute(
+                'UPDATE tickets SET claimed_by=?, deal_amount_usd=?, deal_amount_inr=? WHERE channel_id=?',
+                (staff_id, amount_usd, amount_inr, channel_id))
             await db.commit()
 
     async def close_ticket(self, channel_id: int):
@@ -313,6 +280,7 @@ class Database:
                 INSERT INTO deals (guild_id,ticket_id,exchanger_id,client_id,pair,amount_usd,amount_inr,rate_used)
                 VALUES (?,?,?,?,?,?,?,?)
             ''', (guild_id, ticket_id, exchanger_id, client_id, pair, amount_usd, amount_inr, rate_used))
+            # Update exchanger stats
             await db.execute('''
                 INSERT INTO user_stats (guild_id,user_id,role,total_deals,total_usd,total_inr)
                 VALUES (?,?,'exchanger',1,?,?)
@@ -320,6 +288,7 @@ class Database:
                     total_deals=total_deals+1, total_usd=total_usd+excluded.total_usd,
                     total_inr=total_inr+excluded.total_inr
             ''', (guild_id, exchanger_id, amount_usd, amount_inr))
+            # Update client stats
             await db.execute('''
                 INSERT INTO user_stats (guild_id,user_id,role,total_deals,total_usd,total_inr)
                 VALUES (?,?,'client',1,?,?)
