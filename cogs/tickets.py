@@ -1,31 +1,27 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import asyncio, io
+import asyncio, io, re
 from utils import (
     has_staff_role, has_admin_or_mod, build_ticket_embed,
-    get_category_info, generate_html_transcript, get_rate, is_exchanger_role
+    get_category_info, generate_html_transcript, get_rate
 )
 
-MAX_OPEN = 1  # max open tickets per user
+MAX_OPEN = 1
 
 
-class ClaimAmountModal(discord.ui.Modal, title='Claim Ticket — Enter Deal Amount'):
-    amount = discord.ui.TextInput(
-        label='Deal Amount',
-        placeholder='Enter amount in $ e.g. 15 (for $15 deal)',
-        required=True, max_length=20
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
+def extract_amount_from_answers(answers: dict) -> float | None:
+    """Try to pull a numeric amount from ticket modal answers."""
+    for v in answers.values():
+        # strip currency symbols and commas
+        cleaned = re.sub(r'[₹$,\s]', '', str(v))
         try:
-            usd = float(self.amount.value.strip().replace('$', ''))
+            val = float(cleaned)
+            if val > 0:
+                return val
         except ValueError:
-            return await interaction.response.send_message('❌ Invalid amount.', ephemeral=True)
-
-        cog = interaction.client.get_cog('Tickets')
-        if cog:
-            await cog._do_claim(interaction, usd)
+            continue
+    return None
 
 
 class TicketControlView(discord.ui.View):
@@ -48,6 +44,7 @@ class TicketControlView(discord.ui.View):
         config = await interaction.client.db.get_config(interaction.guild.id)
         if not await has_staff_role(interaction.user, config):
             return await interaction.response.send_message('❌ Staff only.', ephemeral=True)
+
         ticket = await interaction.client.db.get_ticket_by_channel(interaction.channel.id)
         if not ticket:
             return await interaction.response.send_message('❌ Not a ticket channel.', ephemeral=True)
@@ -55,19 +52,28 @@ class TicketControlView(discord.ui.View):
             claimer = interaction.guild.get_member(ticket['claimed_by'])
             return await interaction.response.send_message(
                 f'❌ Already claimed by {claimer.mention if claimer else "someone"}.', ephemeral=True)
-        # Only check limit for exchange tickets
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        cog = interaction.client.get_cog('Tickets')
+
+        # For exchange tickets — check limit using amount from ticket modal
         if ticket['category'] in ('i2c', 'c2i'):
-            await interaction.response.send_modal(ClaimAmountModal())
+            await cog._do_claim(interaction, ticket)
         else:
-            # Support/dispute — no limit check needed
+            # Support/dispute — just claim, no limit check
             await interaction.client.db.claim_ticket(interaction.channel.id, interaction.user.id)
-            user = interaction.guild.get_member(ticket['user_id'])
+            user = guild.get_member(ticket['user_id'])
             embed = build_ticket_embed(ticket['category'], user, ticket['ticket_number'], interaction.user)
             try:
-                await interaction.message.edit(embed=embed)
+                pins = await interaction.channel.pins()
+                for pin in pins:
+                    if pin.author == guild.me:
+                        await pin.edit(embed=embed)
+                        break
             except Exception:
                 pass
-            await interaction.response.send_message(f'✅ {interaction.user.mention} claimed this ticket.')
+            await interaction.followup.send(f'✅ {interaction.user.mention} claimed this ticket.', ephemeral=False)
 
 
 class Tickets(commands.Cog):
@@ -91,7 +97,6 @@ class Tickets(commands.Cog):
             return await interaction.followup.send(
                 f'❌ You already have an open ticket: {ch.mention if ch else "existing channel"}', ephemeral=True)
 
-        # Get/create category
         cat_channel = None
         if config['ticket_category']:
             cat_channel = guild.get_channel(config['ticket_category'])
@@ -120,7 +125,34 @@ class Tickets(commands.Cog):
             topic=f"Ticket #{ticket_num:04d} | {info['label']} | {user} ({user.id})"
         )
 
-        ticket_id = await self.bot.db.create_ticket(guild.id, channel.id, user.id, category, ticket_num)
+        # Extract amount from answers for limit pre-check display
+        amount_usd = None
+        amount_inr = None
+        if answers:
+            raw = extract_amount_from_answers(answers)
+            if raw:
+                rate = await get_rate(self.bot.db, guild.id)
+                config2 = await self.bot.db.get_config(guild.id)
+                if category == 'i2c':
+                    i2c_rate = config2.get('rate_i2c') or 101
+                    amount_inr = raw
+                    amount_usd = round(raw / i2c_rate, 4)
+                elif category == 'c2i':
+                    c2i_below = config2.get('rate_c2i_below') or 97.5
+                    c2i_above = config2.get('rate_c2i_above') or 98.5
+                    sell_rate = c2i_above if raw >= 100 else c2i_below
+                    amount_usd = raw
+                    amount_inr = round(raw * sell_rate, 2)
+
+        await self.bot.db.create_ticket(guild.id, channel.id, user.id, category, ticket_num)
+
+        # Store the pre-calculated amounts on the ticket for claim limit check
+        if amount_usd:
+            await self.bot.db.claim_ticket(channel.id, None, amount_usd, amount_inr)
+            # Reset claimed_by back to None (we just used claim_ticket to store amounts)
+            async with __import__('aiosqlite').connect(self.bot.db.path) as db:
+                await db.execute('UPDATE tickets SET claimed_by=NULL WHERE channel_id=?', (channel.id,))
+                await db.commit()
 
         embed = build_ticket_embed(category, user, ticket_num, modal_answers=answers)
         view = TicketControlView(self.bot)
@@ -132,36 +164,57 @@ class Tickets(commands.Cog):
         if config['log_channel']:
             lch = guild.get_channel(config['log_channel'])
             if lch:
+                info2 = get_category_info(category)
                 lembed = discord.Embed(title='📂 Ticket Opened', color=0x2ECC71,
-                    description=f"**User:** {user.mention}\n**Category:** {info['emoji']} {info['label']}\n**Channel:** {channel.mention}")
+                    description=f"**User:** {user.mention}\n**Category:** {info2['emoji']} {info2['label']}\n**Channel:** {channel.mention}")
+                if amount_usd:
+                    lembed.add_field(name='💲 Amount', value=f'${amount_usd} / ₹{amount_inr:,.2f}')
                 await lch.send(embed=lembed)
 
-    async def _do_claim(self, interaction: discord.Interaction, amount_usd: float):
-        """Called after exchanger enters amount in modal."""
+    async def _do_claim(self, interaction: discord.Interaction, ticket: dict):
+        """Claim an exchange ticket with limit check using stored amount."""
         guild = interaction.guild
         config = await self.bot.db.get_config(guild.id)
-        ticket = await self.bot.db.get_ticket_by_channel(interaction.channel.id)
-        if not ticket:
-            return await interaction.response.send_message('❌ Not a ticket.', ephemeral=True)
 
         rate = await get_rate(self.bot.db, guild.id)
-        amount_inr = round(amount_usd * rate, 2)
 
-        # Check exchanger limit
+        # Get stored amount from ticket
+        amount_usd = ticket.get('deal_amount_usd')
+
+        if not amount_usd or amount_usd <= 0:
+            # Fallback: no amount stored, just claim without limit check
+            await self.bot.db.claim_ticket(interaction.channel.id, interaction.user.id)
+            user = guild.get_member(ticket['user_id'])
+            embed = build_ticket_embed(ticket['category'], user, ticket['ticket_number'], interaction.user)
+            try:
+                pins = await interaction.channel.pins()
+                for pin in pins:
+                    if pin.author == guild.me:
+                        await pin.edit(embed=embed)
+                        break
+            except Exception:
+                pass
+            return await interaction.followup.send(
+                f'✅ {interaction.user.mention} claimed this ticket!\n'
+                f'⚠️ No amount was found in the ticket — limit not tracked.', ephemeral=False)
+
+        amount_inr = ticket.get('deal_amount_inr') or round(amount_usd * rate, 2)
+
+        # ── Limit check ──────────────────────────────────────────────────────
         lim = await self.bot.db.get_exchanger_limit(guild.id, interaction.user.id)
         limit_usd = lim['limit_usd']
         used_usd = lim['used_usd']
 
         if limit_usd > 0:
             if used_usd + amount_usd > limit_usd:
-                avail = limit_usd - used_usd
-                return await interaction.response.send_message(
-                    f'❌ **Limit exceeded!**\n'
-                    f'Your limit: **${limit_usd}**\n'
-                    f'Currently in use: **${used_usd}**\n'
-                    f'Available: **${avail:.2f}**\n'
-                    f'This deal: **${amount_usd}**\n\n'
-                    f'You cannot claim deals that exceed your available limit.',
+                avail = max(0, limit_usd - used_usd)
+                return await interaction.followup.send(
+                    f'❌ **Limit Exceeded!**\n'
+                    f'> Your limit: **${limit_usd}**\n'
+                    f'> Currently in use: **${used_usd:.2f}**\n'
+                    f'> Available: **${avail:.2f}**\n'
+                    f'> This deal needs: **${amount_usd:.2f}**\n\n'
+                    f'You cannot claim this deal as it exceeds your available limit.',
                     ephemeral=True
                 )
 
@@ -174,7 +227,6 @@ class Tickets(commands.Cog):
         user = guild.get_member(ticket['user_id'])
         embed = build_ticket_embed(ticket['category'], user, ticket['ticket_number'], interaction.user)
         try:
-            # Try to find and edit the pinned message
             pins = await interaction.channel.pins()
             for pin in pins:
                 if pin.author == guild.me:
@@ -183,20 +235,20 @@ class Tickets(commands.Cog):
         except Exception:
             pass
 
-        await interaction.response.send_message(
+        new_used = used_usd + amount_usd
+        await interaction.followup.send(
             f'✅ {interaction.user.mention} claimed this ticket!\n'
-            f'💲 Deal Amount: **${amount_usd}** (~₹{amount_inr:,.2f})\n'
-            f'📊 Limit used: **${used_usd + amount_usd:.2f}** / **${limit_usd}**'
+            f'💲 Deal: **${amount_usd:.2f}** (~₹{amount_inr:,.2f})\n'
+            f'📊 Limit: **${new_used:.2f}** used / **${limit_usd}** total',
+            ephemeral=False
         )
 
     async def _close_ticket(self, channel: discord.TextChannel, closer: discord.Member):
         ticket = await self.bot.db.get_ticket_by_channel(channel.id)
         if not ticket:
             return await channel.send('❌ Not a ticket channel.')
-
         guild = channel.guild
         config = await self.bot.db.get_config(guild.id)
-
         if not await has_admin_or_mod(closer, config):
             return await channel.send('❌ Only Admin/Mod can close tickets.')
 
@@ -208,7 +260,6 @@ class Tickets(commands.Cog):
         await self.bot.db.close_ticket(channel.id)
 
         file = discord.File(io.BytesIO(html.encode()), filename=f"ticket-{ticket['ticket_number']:04d}.html")
-
         if config['transcript_channel']:
             tr_ch = guild.get_channel(config['transcript_channel'])
             if tr_ch:

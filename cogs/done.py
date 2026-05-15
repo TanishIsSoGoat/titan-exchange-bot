@@ -12,22 +12,43 @@ class DoneModal(discord.ui.Modal, title='✅ Mark Deal as Done'):
         required=True, max_length=50
     )
     amount_usd = discord.ui.TextInput(
-        label='Amount in USD ($)',
-        placeholder='e.g. 15.5',
-        required=True, max_length=20
+        label='Amount in USD ($) — fill ONE of USD or INR',
+        placeholder='e.g. 15.5  (leave blank if entering INR below)',
+        required=False, max_length=20
     )
     amount_inr = discord.ui.TextInput(
-        label='Amount in INR (₹)',
-        placeholder='e.g. 1567.25',
-        required=True, max_length=20
+        label='Amount in INR (₹) — fill ONE of USD or INR',
+        placeholder='e.g. 1567.25  (leave blank if entering USD above)',
+        required=False, max_length=20
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        usd_raw = self.amount_usd.value.strip().replace('$', '').replace(',', '')
+        inr_raw = self.amount_inr.value.strip().replace('₹', '').replace(',', '')
+
+        if not usd_raw and not inr_raw:
+            return await interaction.response.send_message('❌ Please enter at least one amount (USD or INR).', ephemeral=True)
+
+        rate = await get_rate(interaction.client.db, interaction.guild.id)
+
         try:
-            usd = float(self.amount_usd.value.strip().replace('$', '').replace(',', ''))
-            inr = float(self.amount_inr.value.strip().replace('₹', '').replace(',', ''))
+            if usd_raw and inr_raw:
+                usd = float(usd_raw)
+                inr = float(inr_raw)
+            elif usd_raw:
+                usd = float(usd_raw)
+                config = await interaction.client.db.get_config(interaction.guild.id)
+                c2i_below = config.get('rate_c2i_below') or 97.5
+                c2i_above = config.get('rate_c2i_above') or 98.5
+                sell_rate = c2i_above if usd >= 100 else c2i_below
+                inr = round(usd * sell_rate, 2)
+            else:
+                inr = float(inr_raw)
+                config = await interaction.client.db.get_config(interaction.guild.id)
+                i2c_rate = config.get('rate_i2c') or 101
+                usd = round(inr / i2c_rate, 4)
         except ValueError:
-            return await interaction.response.send_message('❌ Invalid amounts. Use numbers only.', ephemeral=True)
+            return await interaction.response.send_message('❌ Invalid amount. Use numbers only e.g. 15.5', ephemeral=True)
 
         cog = interaction.client.get_cog('Done')
         if cog:
